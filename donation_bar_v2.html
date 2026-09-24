@@ -4,21 +4,19 @@
 <meta charset="UTF-8">
 <title>Donation Bar v2</title>
 <style>
-  /* html/body stay transparent always — the dark theme lives on #controls only,
-     so bulb mode (which hides #controls) is transparent with no overrides needed. */
-  html, body { margin: 0; background: transparent; }
-  body { font-family: sans-serif; color: #eee; }
+  html, body { margin: 0; background: transparent; font-family: sans-serif; color: #eee; }
 
   #controls { background: #14161b; padding: 24px; padding-top: 40px; }
-
-  canvas { display: block; background: transparent; }
   #controls canvas { width: 100%; max-width: 700px; height: 320px; margin-bottom: 8px; background: #000; }
   #bulb-canvas { width: 400px; height: 400px; }
+  canvas { display: block; background: transparent; }
 
   #status { position: fixed; top: 4px; left: 6px; font-size: 11px; color: #777; z-index: 1000; }
   label { display: block; margin: 12px 0 4px; }
   input[type="number"] { width: 100px; background: #22252d; color: #eee; border: 1px solid #444; padding: 4px 6px; }
   button { margin-top: 16px; padding: 8px 16px; }
+  #copy-row { margin-top: 24px; border-top: 1px solid #333; padding-top: 16px; }
+  #copy-status { font-size: 12px; color: #999; margin-left: 8px; }
 </style>
 </head>
 <body>
@@ -27,172 +25,130 @@
 
 <div id="controls">
   <canvas id="rive-canvas"></canvas>
-
   <label>Current amount: <input type="number" id="amount-num" value="0"></label>
   <label>Target amount: <input type="number" id="target-num" value="1000"></label>
   <button id="apply">Apply</button>
-
-  <div style="margin-top:24px; border-top:1px solid #333; padding-top:16px;">
+  <div id="copy-row">
     <button id="copy-link">Copy bulb link for OBS</button>
-    <span id="copy-status" style="font-size:12px; color:#999; margin-left:8px;"></span>
+    <span id="copy-status"></span>
   </div>
 </div>
 
 <canvas id="bulb-canvas" style="display:none;"></canvas>
 
 <script>
-  // Relative path on purpose: put this HTML and rgai_donation_bar_2.riv in the
-  // SAME folder of the repo (e.g. both at the repo root, or both in /v2/), and
-  // this will resolve correctly wherever that folder ends up being served from.
-  // No repo name, no branch name to get wrong.
-  const RIVE_SRC = "rgai_donation_bar_2.riv";
-  const STORAGE_KEY = "donation-bar-state-v2";
+// Put this file and rgai_donation_bar_2.riv in the same folder — relative
+// path means it works wherever that folder is hosted, no URL to update.
+const RIVE_SRC = "rgai_donation_bar_2.riv";
+const STORAGE_KEY = "donation-bar-state-v2";
+const VM_NAME = "DonationData";
 
-  const isBulb = location.hash === "#bulb";
-  if (isBulb) {
-    document.getElementById("controls").remove();
-    document.getElementById("rive-canvas").remove();
+const isBulb = location.hash === "#bulb";
+document.getElementById(isBulb ? "controls" : "bulb-canvas").remove();
+const canvas = document.getElementById(isBulb ? "bulb-canvas" : "rive-canvas");
+canvas.style.display = "block";
+
+const statusEl = document.getElementById("status");
+const log = (msg) => { statusEl.textContent = msg; console.log("[donation-bar-v2]", msg); };
+
+document.getElementById("copy-link")?.addEventListener("click", () => {
+  const bulbUrl = location.href.split("#")[0] + "#bulb";
+  const copyStatus = document.getElementById("copy-status");
+  const finish = (ok) => {
+    copyStatus.textContent = ok ? "Copied!" : `Couldn't copy — copy manually: ${bulbUrl}`;
+    setTimeout(() => { copyStatus.textContent = ""; }, 4000);
+  };
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(bulbUrl).then(() => finish(true), () => finish(false));
   } else {
-    document.getElementById("bulb-canvas").remove();
+    const ta = Object.assign(document.createElement("textarea"), { value: bulbUrl });
+    ta.style.cssText = "position:fixed;opacity:0";
+    document.body.appendChild(ta);
+    ta.select();
+    finish((() => { try { return document.execCommand("copy"); } catch { return false; } })());
+    ta.remove();
   }
-  const canvas = isBulb ? document.getElementById("bulb-canvas") : document.getElementById("rive-canvas");
-  canvas.style.display = "block";
+});
 
-  const copyBtn = document.getElementById("copy-link");
-  if (copyBtn) {
-    copyBtn.addEventListener("click", () => {
-      const bulbUrl = location.href.split("#")[0] + "#bulb";
-      const copyStatus = document.getElementById("copy-status");
+const riveScript = document.createElement("script");
+riveScript.src = "https://unpkg.com/@rive-app/canvas@2.32.0";
+riveScript.onload = boot;
+riveScript.onerror = () => log("Failed to load the Rive runtime — check your internet connection.");
+document.head.appendChild(riveScript);
 
-      const finish = (ok) => {
-        copyStatus.textContent = ok ? "Copied!" : "Couldn't copy — link shown below, copy manually:";
-        if (!ok) copyStatus.textContent += " " + bulbUrl;
-        setTimeout(() => { copyStatus.textContent = ""; }, 4000);
-      };
+function boot() {
+  let riveInstance, props = null;
+  let currentAmount = 0, currentTarget = 1000;
 
-      if (navigator.clipboard && window.isSecureContext) {
-        navigator.clipboard.writeText(bulbUrl).then(() => finish(true), () => finish(false));
-      } else {
-        const ta = document.createElement("textarea");
-        ta.value = bulbUrl;
-        ta.style.position = "fixed";
-        ta.style.opacity = "0";
-        document.body.appendChild(ta);
-        ta.select();
-        let ok = false;
-        try { ok = document.execCommand("copy"); } catch (e) {}
-        document.body.removeChild(ta);
-        finish(ok);
+  // Explicit two-step bind (not autoBind) so a failure tells you exactly
+  // which piece is missing, instead of one vague "not found".
+  function bindAndGetProps() {
+    const vm = riveInstance.viewModelByName(VM_NAME);
+    if (!vm) return log(`No ViewModel named '${VM_NAME}' in this file.`);
+    const vmi = vm.defaultInstance();
+    if (!vmi) return log(`'${VM_NAME}' has no default instance — check the Artboard's Default View Model setting in Rive.`);
+    riveInstance.bindViewModelInstance(vmi);
+
+    const amountProp = vmi.number("donationAmount");
+    const targetProp = vmi.number("donationTarget");
+    const milestoneProp = vmi.number("Milestone");
+    if (!amountProp || !targetProp) return log("Bound, but donationAmount/donationTarget weren't found on it.");
+
+    props = { amountProp, targetProp, milestoneProp };
+    log("Ready.");
+  }
+
+  function tween(prop, from, to, duration = 900) {
+    const start = performance.now();
+    (function step(now) {
+      const t = Math.min(1, (now - start) / duration);
+      prop.value = from + (to - from) * (1 - Math.pow(1 - t, 3));
+      if (t < 1) requestAnimationFrame(step);
+    })(start);
+  }
+
+  function applyState(amount, target) {
+    if (!props) return;
+    tween(props.amountProp, currentAmount, amount);
+    tween(props.targetProp, currentTarget, target);
+    if (props.milestoneProp) props.milestoneProp.value = 0;
+    currentAmount = amount;
+    currentTarget = target;
+  }
+
+  riveInstance = new rive.Rive({
+    src: RIVE_SRC,
+    canvas,
+    artboard: "Artboard",
+    autoplay: true,
+    stateMachines: "TierCycling",
+    onLoad: () => {
+      riveInstance.resizeDrawingSurfaceToCanvas();
+      bindAndGetProps();
+      if (isBulb && props) {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) { const s = JSON.parse(saved); applyState(s.amount, s.target); }
+      }
+    },
+    onLoadError: (e) => { log("Failed to load the .riv file — see console."); console.error(e); },
+  });
+
+  if (isBulb) {
+    window.addEventListener("storage", (e) => {
+      if (e.key === STORAGE_KEY && e.newValue) {
+        const s = JSON.parse(e.newValue);
+        applyState(s.amount, s.target);
       }
     });
-  }
-
-  const statusEl = document.getElementById("status");
-  function setStatus(msg) {
-    if (statusEl) statusEl.textContent = msg;
-    console.log("[donation-bar-v2]", msg);
-  }
-
-  const riveScript = document.createElement("script");
-  riveScript.src = "https://unpkg.com/@rive-app/canvas@2.32.0";
-  riveScript.onload = boot;
-  riveScript.onerror = () => setStatus("Failed to load the Rive runtime — check your internet connection.");
-  document.head.appendChild(riveScript);
-
-  function boot() {
-    let riveInstance = null;
-    let currentAmount = 0, currentTarget = 1000;
-
-    // Explicit bind instead of autoBind — this tells us exactly WHICH part
-    // is missing if something's wrong, instead of one vague "not found".
-    function bindViewModel() {
-      const vm = riveInstance.viewModelByName("DonationData");
-      if (!vm) {
-        setStatus("No ViewModel named 'DonationData' in this file.");
-        return null;
-      }
-      const vmi = vm.defaultInstance();
-      if (!vmi) {
-        setStatus("'DonationData' exists, but has no default instance — check the Artboard's Default View Model setting in Rive.");
-        return null;
-      }
-      riveInstance.bindViewModelInstance(vmi);
-      return vmi;
-    }
-
-    function getProps(vmi) {
-      const amountProp = vmi.number("donationAmount");
-      const targetProp = vmi.number("donationTarget");
-      const milestoneProp = vmi.number("Milestone");
-      if (!amountProp || !targetProp) {
-        setStatus("Bound to DonationData, but donationAmount/donationTarget weren't found on it.");
-        return null;
-      }
-      return { amountProp, targetProp, milestoneProp };
-    }
-
-    let props = null;
-
-    function tween(prop, from, to, duration = 900) {
-      const start = performance.now();
-      function step(now) {
-        const t = Math.min(1, (now - start) / duration);
-        const eased = 1 - Math.pow(1 - t, 3);
-        prop.value = from + (to - from) * eased;
-        if (t < 1) requestAnimationFrame(step);
-      }
-      requestAnimationFrame(step);
-    }
-
-    function applyState(amount, target) {
-      if (!props) return;
-      tween(props.amountProp, currentAmount, amount);
-      tween(props.targetProp, currentTarget, target);
-      if (props.milestoneProp) props.milestoneProp.value = 0;
-      currentAmount = amount;
-      currentTarget = target;
-    }
-
-    riveInstance = new rive.Rive({
-      src: RIVE_SRC,
-      canvas: canvas,
-      artboard: "Artboard",
-      autoplay: true,
-      stateMachines: "TierCycling",
-      onLoad: () => {
-        riveInstance.resizeDrawingSurfaceToCanvas();
-        const vmi = bindViewModel();
-        if (vmi) {
-          props = getProps(vmi);
-          if (props) setStatus("Ready.");
-        }
-        if (isBulb && props) {
-          const saved = localStorage.getItem(STORAGE_KEY);
-          if (saved) { const s = JSON.parse(saved); applyState(s.amount, s.target); }
-        }
-      },
-      onLoadError: (e) => {
-        setStatus("Failed to load the .riv file — see console.");
-        console.error(e);
-      },
+  } else {
+    document.getElementById("apply").addEventListener("click", () => {
+      const amount = Number(document.getElementById("amount-num").value);
+      const target = Number(document.getElementById("target-num").value);
+      applyState(amount, target);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ amount, target }));
     });
-
-    if (isBulb) {
-      window.addEventListener("storage", (e) => {
-        if (e.key === STORAGE_KEY && e.newValue) {
-          const s = JSON.parse(e.newValue);
-          applyState(s.amount, s.target);
-        }
-      });
-    } else {
-      document.getElementById("apply").addEventListener("click", () => {
-        const amount = Number(document.getElementById("amount-num").value);
-        const target = Number(document.getElementById("target-num").value);
-        applyState(amount, target);
-        localStorage.setItem(STORAGE_KEY, JSON.stringify({ amount, target }));
-      });
-    }
   }
+}
 </script>
 </body>
 </html>
